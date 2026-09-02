@@ -10,6 +10,15 @@ from .images import (
     convert_images,
     probe_image,
 )
+from .frame_interpolation import (
+    FrameInterpolationBatchResult,
+    FrameInterpolationCapabilities,
+    FrameInterpolationOptions,
+    FrameInterpolationResult,
+    interpolate_video,
+    interpolate_videos,
+    probe_frame_interpolation_capabilities,
+)
 from .video import (
     ConversionOptions,
     ConversionResult,
@@ -30,10 +39,17 @@ __all__ = [
     "ImageConversionOptions",
     "ImageConversionResult",
     "ImageConversionFailure",
+    "FrameInterpolationBatchResult",
+    "FrameInterpolationCapabilities",
+    "FrameInterpolationOptions",
+    "FrameInterpolationResult",
     "convert_image",
     "convert_images",
     "convert_video",
     "convert_videos",
     "probe_image",
     "probe_video",
+    "interpolate_video",
+    "interpolate_videos",
+    "probe_frame_interpolation_capabilities",
 ]

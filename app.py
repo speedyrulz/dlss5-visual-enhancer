@@ -18,13 +18,22 @@ from src.images import (
     take_image_preview,
 )
 from src.naming import RENAME_MODES
+from src.ffmpeg import probe_nvenc_codecs, probe_video
+from src.frame_interpolation import (
+    ENGINE_CHOICES,
+    FPS_CHOICES,
+    FrameInterpolationOptions,
+    choose_interpolation_plan,
+    interpolate_video,
+    interpolate_videos,
+    probe_frame_interpolation_capabilities,
+)
 from src.runtime import (
-    AUTO_GPU,
     LOGS,
     OUTPUTS,
     cancel_active_job,
-    gpu_choices,
-    set_preferred_gpu,
+    gpu_choice_label,
+    validate_gpu_runtime,
 )
 from src.prepare import prepare_runtime
 from src.settings import (
@@ -33,7 +42,10 @@ from src.settings import (
     DEFAULT_SETTINGS,
     QUALITY_CHOICES,
     UISettings,
+    export_settings_preset,
+    import_settings_preset,
     load_settings,
+    preset_filename,
     save_settings,
 )
 from src.video import (
@@ -67,7 +79,9 @@ APP_CSS = """
 #image-upload-list .file-preview-holder,
 #image-output-list .file-preview-holder,
 #video-upload-list .file-preview-holder,
-#video-output-list .file-preview-holder {
+#video-output-list .file-preview-holder,
+#frame-interpolation-upload-list .file-preview-holder,
+#frame-interpolation-output-list .file-preview-holder {
     max-height: 210px !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
@@ -78,7 +92,9 @@ APP_CSS = """
 #image-upload-list .file-preview,
 #image-output-list .file-preview,
 #video-upload-list .file-preview,
-#video-output-list .file-preview {
+#video-output-list .file-preview,
+#frame-interpolation-upload-list .file-preview,
+#frame-interpolation-output-list .file-preview {
     max-height: none !important;
 }
 
@@ -243,59 +259,133 @@ def persist_video_settings(
     return _shared_dlss_values(settings)
 
 
-def _gpu_dropdown_state(selection: str) -> tuple[list[str], str]:
-    """Current GPU choices, falling back to automatic when the saved GPU is gone."""
-    choices = gpu_choices()
-    return choices, selection if selection in choices else AUTO_GPU
+def persist_frame_interpolation_settings(
+    target_fps: str,
+    engine: str,
+    codec: str,
+    container: str,
+    quality: str,
+    rename_mode: str,
+    custom_suffix: str,
+) -> None:
+    global _CURRENT_SETTINGS
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+        settings = replace(
+            current,
+            frame_interpolation_target_fps=target_fps,
+            frame_interpolation_engine=engine,
+            frame_interpolation_codec=codec,
+            frame_interpolation_container=container,
+            frame_interpolation_quality=quality,
+            frame_interpolation_rename_mode=rename_mode,
+            frame_interpolation_custom_suffix=custom_suffix,
+        )
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
 
 
-def build_gpu_control(settings: UISettings):
-    choices, value = _gpu_dropdown_state(settings.gpu)
-    return gr.Dropdown(
-        choices=choices,
-        value=value,
-        label="GPU",
-        info=(
-            "Which detected RTX GPU renders. Auto uses the first one. The render "
-            "fails fast if the native worker cannot bind the selected card."
+def _settings_component_values(settings: UISettings) -> tuple:
+    shared = _shared_dlss_values(settings)
+    return (
+        *shared,
+        *shared,
+        settings.image_format,
+        settings.image_quality,
+        settings.image_rename_mode,
+        gr.update(
+            value=settings.image_custom_suffix,
+            interactive=settings.image_rename_mode == "Custom",
         ),
+        settings.codec,
+        settings.container,
+        settings.quality,
+        settings.video_rename_mode,
+        gr.update(
+            value=settings.video_custom_suffix,
+            interactive=settings.video_rename_mode == "Custom",
+        ),
+        settings.frame_interpolation_target_fps,
+        settings.frame_interpolation_engine,
+        settings.frame_interpolation_codec,
+        settings.frame_interpolation_container,
+        settings.frame_interpolation_quality,
+        settings.frame_interpolation_rename_mode,
+        gr.update(
+            value=settings.frame_interpolation_custom_suffix,
+            interactive=settings.frame_interpolation_rename_mode == "Custom",
+        ),
+        settings.ai_gpu_uuid,
+        settings.video_gpu_uuid,
     )
 
 
-def persist_gpu(gpu: str):
-    """Apply and save the GPU choice, then mirror it onto the other tab."""
-    global _CURRENT_SETTINGS
-    choices, value = _gpu_dropdown_state(gpu)
-    with _CONFIG_LOCK:
-        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
-        settings = replace(current, gpu=value)
-        if settings != current:
-            save_settings(CONFIG_PATH, settings)
-        _CURRENT_SETTINGS = settings
-    set_preferred_gpu(value)
-    return gr.update(choices=choices, value=value)
-
-
-def refresh_gpus(gpu: str):
-    """Re-enumerate GPUs so a newly available card can be picked without a restart."""
-    return persist_gpu(gpu)
-
-
-def persist_dual_gpu_encode(enabled: bool) -> bool:
-    global _CURRENT_SETTINGS
-    with _CONFIG_LOCK:
-        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
-        settings = replace(current, dual_gpu_encode=bool(enabled))
-        if settings != current:
-            save_settings(CONFIG_PATH, settings)
-        _CURRENT_SETTINGS = settings
-    return bool(enabled)
-
-
-def _saved_dual_gpu_encode() -> bool:
+def _processing_gpu_settings() -> tuple[str, str]:
     with _CONFIG_LOCK:
         settings = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
-    return settings.dual_gpu_encode
+    return settings.ai_gpu_uuid, settings.video_gpu_uuid
+
+
+def _gpu_choices(prepared) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    automatic = [("Automatic (first compatible)", "auto")]
+    ai = []
+    for gpu in prepared.gpus:
+        if not gpu.get("ai_compatible") or not gpu.get("adapter_luid"):
+            continue
+        try:
+            validate_gpu_runtime(gpu, prepared.runtime_bundle)
+        except RuntimeError:
+            continue
+        ai.append((gpu_choice_label(gpu), str(gpu["uuid"])))
+    video = [
+        (gpu_choice_label(gpu), str(gpu["uuid"]))
+        for gpu in prepared.gpus
+        if gpu.get("cuda_ordinal") is not None
+        and probe_nvenc_codecs(int(gpu["cuda_ordinal"]))
+    ]
+    return automatic + ai, automatic + video
+
+
+def _normalize_gpu_settings(settings: UISettings, prepared) -> tuple[UISettings, str]:
+    ai_choices, video_choices = _gpu_choices(prepared)
+    ai_values = {value for _label, value in ai_choices}
+    video_values = {value for _label, value in video_choices}
+    warnings = []
+    ai_uuid = settings.ai_gpu_uuid
+    video_uuid = settings.video_gpu_uuid
+    if ai_uuid not in ai_values:
+        warnings.append("Saved AI Processing GPU is unavailable; using Automatic.")
+        ai_uuid = "auto"
+    if video_uuid not in video_values:
+        warnings.append("Saved Video Processing GPU is unavailable; using Automatic.")
+        video_uuid = "auto"
+    return replace(settings, ai_gpu_uuid=ai_uuid, video_gpu_uuid=video_uuid), " ".join(warnings)
+
+
+def persist_gpu_settings(ai_gpu_uuid: str, video_gpu_uuid: str) -> str:
+    global _CURRENT_SETTINGS
+    prepared = prepare_runtime()
+    ai_choices, video_choices = _gpu_choices(prepared)
+    if ai_gpu_uuid not in {value for _label, value in ai_choices}:
+        raise gr.Error("Choose an available AI Processing GPU.")
+    if video_gpu_uuid not in {value for _label, value in video_choices}:
+        raise gr.Error("Choose an available Video Processing GPU.")
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+        settings = replace(
+            current, ai_gpu_uuid=ai_gpu_uuid, video_gpu_uuid=video_gpu_uuid
+        )
+        if settings != current:
+            save_settings(CONFIG_PATH, settings)
+        _CURRENT_SETTINGS = settings
+    ai_name = "Automatic" if ai_gpu_uuid == "auto" else next(
+        label for label, value in ai_choices if value == ai_gpu_uuid
+    )
+    video_name = "Automatic" if video_gpu_uuid == "auto" else next(
+        label for label, value in video_choices if value == video_gpu_uuid
+    )
+    return f"AI Processing: {ai_name}\n\nVideo Processing: {video_name}"
 
 
 def reset_saved_settings() -> tuple:
@@ -303,27 +393,62 @@ def reset_saved_settings() -> tuple:
     with _CONFIG_LOCK:
         save_settings(CONFIG_PATH, DEFAULT_SETTINGS)
         _CURRENT_SETTINGS = DEFAULT_SETTINGS
-    set_preferred_gpu(DEFAULT_SETTINGS.gpu)
-    gpu_choices_list, gpu_value = _gpu_dropdown_state(DEFAULT_SETTINGS.gpu)
-    shared = _shared_dlss_values(DEFAULT_SETTINGS)
-    message = "All Image and Video settings were reset to defaults."
+    message = "All Image, Video, and Frame Interpolation settings were reset to defaults."
     return (
-        *shared,
-        *shared,
-        DEFAULT_SETTINGS.image_format,
-        DEFAULT_SETTINGS.image_quality,
-        DEFAULT_SETTINGS.image_rename_mode,
-        gr.update(value=DEFAULT_SETTINGS.image_custom_suffix, interactive=False),
-        DEFAULT_SETTINGS.codec,
-        DEFAULT_SETTINGS.container,
-        DEFAULT_SETTINGS.quality,
-        DEFAULT_SETTINGS.video_rename_mode,
-        gr.update(value=DEFAULT_SETTINGS.video_custom_suffix, interactive=False),
-        gr.update(choices=gpu_choices_list, value=gpu_value),
-        gr.update(choices=gpu_choices_list, value=gpu_value),
-        DEFAULT_SETTINGS.dual_gpu_encode,
+        *_settings_component_values(DEFAULT_SETTINGS),
         message,
         message,
+        message,
+        "AI Processing and Video Processing GPU selections were reset to Automatic.",
+    )
+
+
+def settings_preset_download(name: str) -> str | None:
+    if not isinstance(name, str) or not name.strip():
+        return None
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+    try:
+        path = export_settings_preset(name, current)
+    except ValueError:
+        return None
+    return str(path)
+
+
+def settings_preset_export_status(name: str) -> str:
+    try:
+        filename = preset_filename(name)
+    except ValueError as exc:
+        return f"Export failed: {exc}"
+    return f"Exported preset {name.strip()!r} as {filename}."
+
+
+def apply_settings_preset(
+    uploaded_path: str | None, current_name: str
+) -> tuple:
+    global _CURRENT_SETTINGS
+    with _CONFIG_LOCK:
+        current = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+        try:
+            if not uploaded_path:
+                raise ValueError("Choose a JSON preset file before importing.")
+            name, imported = import_settings_preset(uploaded_path, current)
+            imported, gpu_warning = _normalize_gpu_settings(
+                imported, prepare_runtime()
+            )
+            save_settings(CONFIG_PATH, imported)
+        except (OSError, ValueError) as exc:
+            return (
+                current_name,
+                *_settings_component_values(current),
+                f"Import failed: {exc}",
+            )
+        _CURRENT_SETTINGS = imported
+    return (
+        name,
+        *_settings_component_values(imported),
+        f"Imported preset {name!r}; all tabs and saved startup settings were updated."
+        + (f" {gpu_warning}" if gpu_warning else ""),
     )
 
 
@@ -348,7 +473,10 @@ def _process_video(
     if not input_path:
         raise gr.Error("Choose a video first.")
     is_preview = preview_seconds is not None or preview_frames is not None
+    ai_gpu_uuid, video_gpu_uuid = _processing_gpu_settings()
     options = ConversionOptions(
+        ai_gpu_uuid=ai_gpu_uuid,
+        video_gpu_uuid=video_gpu_uuid,
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,
@@ -363,7 +491,6 @@ def _process_video(
         quality=quality,
         preview_seconds=preview_seconds,
         preview_frames=preview_frames,
-        dual_gpu_encode=_saved_dual_gpu_encode(),
     )
 
     def report(value: float, message: str) -> None:
@@ -449,6 +576,178 @@ def update_video_preview_mode(paths: list[str] | str | None):
     )
 
 
+def frame_interpolation_capability_text() -> str:
+    ai_gpu_uuid, _video_gpu_uuid = _processing_gpu_settings()
+    capabilities = probe_frame_interpolation_capabilities(ai_gpu_uuid)
+    hags = "Enabled" if capabilities.hags_enabled else "Disabled"
+    native = (
+        f"{capabilities.native_multiplier}× "
+        f"({capabilities.native_generated_frame_max} generated frame per evaluation)"
+    )
+    cascade = "Available" if capabilities.cascade_available else "Unavailable"
+    state = "Ready" if capabilities.available else "Unavailable"
+    detail = f"\n{capabilities.detail}" if capabilities.detail else ""
+    return (
+        f"{state} — GPU: {capabilities.gpu} | Driver: {capabilities.driver} | "
+        f"HAGS: {hags}\nNative maximum: {native} | Experimental cascade: {cascade} | "
+        f"DLSSG runtime: {capabilities.runtime_version}{detail}"
+    )
+
+
+def describe_frame_interpolation_plan(
+    paths: list[str] | str | None,
+    target_fps: str,
+    engine: str,
+) -> str:
+    selected = first_video_path(paths)
+    if not selected:
+        return "Choose a video to preflight its DLSSG path and temporal precision."
+    try:
+        metadata = probe_video(selected, count_mode="metadata")
+        ai_gpu_uuid, _video_gpu_uuid = _processing_gpu_settings()
+        capabilities = probe_frame_interpolation_capabilities(ai_gpu_uuid)
+        plan = choose_interpolation_plan(
+            metadata["rate"],
+            FrameInterpolationOptions(target_fps=target_fps).target_rate,
+            engine,
+            capabilities.native_multiplier,
+            cfr=bool(metadata.get("cfr", True)),
+        )
+        if plan.cascade_stages:
+            precision = (
+                f"≤ {float(plan.maximum_temporal_error) * 1000:.3f} ms "
+                f"(1/{2 * plan.grid_multiplier} source-frame interval)"
+            )
+        elif plan.path == "Native DLSSG":
+            precision = "Exact native temporal grid"
+        else:
+            precision = "Nearest real source frame"
+        return (
+            f"{Path(selected).name}: {metadata['rate']} FPS → {target_fps} FPS | "
+            f"Path: {plan.path} | Cascade stages: {plan.cascade_stages} | "
+            f"Internal grid: {plan.grid_multiplier}× | Precision: {precision}"
+        )
+    except Exception as exc:
+        return f"Preflight: {exc}"
+
+
+def update_frame_interpolation_preview_mode(
+    paths: list[str] | str | None,
+    target_fps: str,
+    engine: str,
+):
+    normalized = _normalize_video_paths(paths)
+    single = len(normalized) == 1
+    return (
+        gr.update(value=normalized[0] if single else None, visible=single),
+        gr.update(value=None, visible=single),
+        gr.update(visible=single),
+        describe_frame_interpolation_plan(paths, target_fps, engine),
+    )
+
+
+def render_frame_interpolation_batch(
+    input_paths: list[str] | str | None,
+    target_fps: str,
+    engine: str,
+    codec: str,
+    container: str,
+    quality: str,
+    rename_mode: str,
+    custom_suffix: str,
+    progress=gr.Progress(track_tqdm=False),
+):
+    paths = _normalize_video_paths(input_paths)
+    if not paths:
+        raise gr.Error("Choose at least one video first.")
+    options = FrameInterpolationOptions(
+        ai_gpu_uuid=_processing_gpu_settings()[0],
+        video_gpu_uuid=_processing_gpu_settings()[1],
+        target_fps=target_fps,
+        engine=engine,
+        codec=codec,
+        container=container,
+        quality=quality,
+        rename_mode=rename_mode,
+        custom_suffix=custom_suffix,
+    )
+
+    def report(value: float, message: str) -> None:
+        progress(value, desc=message)
+
+    try:
+        result = interpolate_videos(paths, options, report)
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(str(exc)) from exc
+    ordered: list[tuple[int, list[str]]] = []
+    for item in result.successes:
+        value = item.result
+        details = (
+            f"{value.output_frames} frames; {value.selected_path}; "
+            f"native {value.native_multiplier}×; cascade stages {value.cascade_stages}; "
+            f"copied {value.copied_frames}, DLSSG {value.generated_frames}, "
+            f"cuts {value.scene_cuts}; report: {value.report_path}"
+        )
+        ordered.append(
+            (item.index, [Path(item.input_path).name, "Complete", Path(value.output_path).name, details])
+        )
+    for item in result.failures:
+        state = "Skipped" if item.error == "Cancelled before rendering." else (
+            "Cancelled" if item.cancelled else "Failed"
+        )
+        ordered.append((item.index, [Path(item.input_path).name, state, "", item.error]))
+    rows = [row for _index, row in sorted(ordered, key=lambda entry: entry[0])]
+    files = [item.result.output_path for item in result.successes]
+    preview = None
+    if len(paths) == 1 and result.successes and Path(files[0]).suffix.lower() == ".mp4":
+        preview = files[0]
+    status = (
+        f"{'Cancelled' if result.cancelled else 'Complete'}: "
+        f"{len(result.successes)} completed, {len(result.failures)} failed/cancelled. "
+        f"Batch manifest: {result.manifest_path}"
+    )
+    return gr.update(value=preview, visible=len(paths) == 1), files, rows, status
+
+
+def preview_frame_interpolation(
+    input_paths: list[str] | str | None,
+    target_fps: str,
+    engine: str,
+    codec: str,
+    container: str,
+    quality: str,
+    progress=gr.Progress(track_tqdm=False),
+):
+    selected = first_video_path(input_paths)
+    if not selected:
+        raise gr.Error("Choose one video first.")
+    options = FrameInterpolationOptions(
+        ai_gpu_uuid=_processing_gpu_settings()[0],
+        video_gpu_uuid=_processing_gpu_settings()[1],
+        target_fps=target_fps,
+        engine=engine,
+        codec="H.264",
+        container="MP4",
+        quality=quality,
+        preview_seconds=PREVIEW_SECONDS,
+    )
+    try:
+        result = interpolate_video(
+            selected,
+            options,
+            lambda value, message: progress(value, desc=message),
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        raise gr.Error(str(exc)) from exc
+    return result.output_path, (
+        f"Preview complete: {result.output_frames} frames, {result.selected_path}, "
+        f"{result.cascade_stages} cascade stage(s), {result.generated_frames} DLSSG-selected "
+        f"frames in {result.elapsed_seconds:.1f}s. Report: {result.report_path}"
+    )
+
+
 def render_video_batch(
     input_paths: list[str] | str | None,
     nr_preset: str,
@@ -471,6 +770,8 @@ def render_video_batch(
     if not paths:
         raise gr.Error("Choose at least one video first.")
     options = ConversionOptions(
+        ai_gpu_uuid=_processing_gpu_settings()[0],
+        video_gpu_uuid=_processing_gpu_settings()[1],
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,
@@ -485,7 +786,6 @@ def render_video_batch(
         quality=quality,
         rename_mode=rename_mode,
         custom_suffix=custom_suffix,
-        dual_gpu_encode=_saved_dual_gpu_encode(),
     )
 
     def report(value: float, message: str) -> None:
@@ -638,6 +938,7 @@ def render_image_batch(
     if isinstance(input_paths, str):
         input_paths = [input_paths]
     options = ImageConversionOptions(
+        ai_gpu_uuid=_processing_gpu_settings()[0],
         nr_preset=nr_preset,
         nr_style=nr_style,
         nr_intensity=nr_intensity,
@@ -749,9 +1050,13 @@ def build_dlss_model_control(settings: UISettings):
 def build_app() -> gr.Blocks:
     """Build the UI from the cached settings without rewriting configuration."""
     global _CURRENT_SETTINGS
+    prepared = prepare_runtime()
     settings = _CURRENT_SETTINGS or load_settings(CONFIG_PATH)
+    settings, gpu_warning = _normalize_gpu_settings(settings, prepared)
+    if settings != (_CURRENT_SETTINGS or load_settings(CONFIG_PATH)):
+        save_settings(CONFIG_PATH, settings)
     _CURRENT_SETTINGS = settings
-    set_preferred_gpu(settings.gpu)
+    ai_gpu_choices, video_gpu_choices = _gpu_choices(prepared)
     upload_types = ["image", ".svg", ".heic", ".heif", *sorted(RAW_EXTENSIONS)]
 
     with gr.Blocks(title="DLSS 5 Visual Enhancer") as demo:
@@ -825,9 +1130,6 @@ def build_app() -> gr.Blocks:
                                 placeholder="_DLSS5",
                                 interactive=settings.image_rename_mode == "Custom",
                             )
-                        with gr.Row():
-                            image_gpu = build_gpu_control(settings)
-                            image_gpu_refresh = gr.Button("Refresh GPUs")
                         gr.Markdown(
                             "Images are processed as 8-bit SDR sRGB. Animated and multipage "
                             "files use their first frame/page."
@@ -925,17 +1227,6 @@ def build_app() -> gr.Blocks:
                                 placeholder="_DLSS5",
                                 interactive=settings.video_rename_mode == "Custom",
                             )
-                        with gr.Row():
-                            video_gpu = build_gpu_control(settings)
-                            video_gpu_refresh = gr.Button("Refresh GPUs")
-                        video_dual_gpu = gr.Checkbox(
-                            value=settings.dual_gpu_encode,
-                            label="Use both GPUs (encode on the other GPU)",
-                            info=(
-                                "DLSS renders on the GPU above; NVENC encoding runs on the "
-                                "other detected RTX card. Ignored with a single GPU."
-                            ),
-                        )
                         gr.Checkbox(
                             value=False,
                             interactive=False,
@@ -972,6 +1263,181 @@ def build_app() -> gr.Blocks:
                             label="Batch results",
                             wrap=True,
                         )
+
+            with gr.Tab("Frame Interpolation", id="frame-interpolation"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        frame_interpolation_sources = gr.File(
+                            label="Input video(s)",
+                            file_count="multiple",
+                            file_types=["video"],
+                            type="filepath",
+                            allow_reordering=True,
+                            elem_id="frame-interpolation-upload-list",
+                        )
+                        frame_interpolation_input_preview = gr.Video(
+                            label="Input video preview",
+                            interactive=False,
+                            visible=False,
+                        )
+                        with gr.Accordion("DLSS Frame Generation Settings", open=True):
+                            with gr.Row():
+                                frame_interpolation_target_fps = gr.Dropdown(
+                                    FPS_CHOICES,
+                                    value=settings.frame_interpolation_target_fps,
+                                    label="Output FPS",
+                                    info="Fractional choices use exact 1001-based rates.",
+                                )
+                                frame_interpolation_engine = gr.Radio(
+                                    ENGINE_CHOICES,
+                                    value=settings.frame_interpolation_engine,
+                                    label="DLSS engine",
+                                    info=(
+                                        "Auto uses a supported exact native grid, then the "
+                                        "2× cascade when required."
+                                    ),
+                                )
+                            frame_interpolation_capabilities = gr.Textbox(
+                                value=frame_interpolation_capability_text(),
+                                label="GPU / HAGS / driver / DLSSG capability",
+                                interactive=False,
+                                lines=3,
+                            )
+                            frame_interpolation_plan = gr.Textbox(
+                                value=(
+                                    "Choose a video to preflight its DLSSG path and temporal "
+                                    "precision."
+                                ),
+                                label="Per-file interpolation plan",
+                                interactive=False,
+                                lines=2,
+                            )
+                        frame_interpolation_quality = gr.Radio(
+                            QUALITY_CHOICES,
+                            value=settings.frame_interpolation_quality,
+                            label="Encoding quality",
+                            info="Auto uses output resolution, selected FPS, and codec.",
+                        )
+                        with gr.Row():
+                            frame_interpolation_codec = gr.Dropdown(
+                                CODEC_CHOICES,
+                                value=settings.frame_interpolation_codec,
+                                label="Video codec",
+                            )
+                            frame_interpolation_container = gr.Dropdown(
+                                CONTAINER_CHOICES,
+                                value=settings.frame_interpolation_container,
+                                label="Container",
+                            )
+                        with gr.Row():
+                            frame_interpolation_rename_mode = gr.Radio(
+                                RENAME_MODES,
+                                value=settings.frame_interpolation_rename_mode,
+                                label="Rename",
+                                info=(
+                                    "Auto adds a DLSSFG timestamp; Copy keeps the original base "
+                                    "name; Custom appends your suffix."
+                                ),
+                            )
+                            frame_interpolation_custom_suffix = gr.Textbox(
+                                value=settings.frame_interpolation_custom_suffix,
+                                label="Custom suffix",
+                                placeholder="_DLSSFG",
+                                interactive=(
+                                    settings.frame_interpolation_rename_mode == "Custom"
+                                ),
+                            )
+                        gr.Markdown(
+                            "Pure NVIDIA DLSSG: CPU optical flow supplies guide vectors only; "
+                            "every invented image is returned by signed DLSSG 310.7. HDR "
+                            "PQ/HLG input is rejected in v1. Maximum output/source rate is 6×."
+                        )
+                        with gr.Row():
+                            frame_interpolation_preview = gr.Button(
+                                "Preview 3 sec", visible=False
+                            )
+                            frame_interpolation_render = gr.Button(
+                                "Interpolate video(s)", variant="primary"
+                            )
+                            frame_interpolation_stop = gr.Button("Stop", variant="stop")
+                            frame_interpolation_reset = gr.Button("Reset settings")
+                        frame_interpolation_status = gr.Textbox(
+                            label="Status", interactive=False
+                        )
+                    with gr.Column(scale=3):
+                        frame_interpolation_output_video = gr.Video(
+                            label="Interpolated output",
+                            interactive=False,
+                            visible=False,
+                        )
+                        frame_interpolation_output_files = gr.File(
+                            label="Interpolated video files",
+                            file_count="multiple",
+                            interactive=False,
+                            elem_id="frame-interpolation-output-list",
+                        )
+                        frame_interpolation_results = gr.Dataframe(
+                            headers=["Input", "Result", "Output", "Details"],
+                            datatype=["str", "str", "str", "str"],
+                            interactive=False,
+                            label="Batch results",
+                            wrap=True,
+                        )
+
+            with gr.Tab("Settings", id="settings"):
+                gr.Markdown(
+                    "## GPU Selection\n"
+                    "AI Processing controls DLSS and Frame Generation. Video Processing "
+                    "controls FFmpeg NVENC only; ProRes and mux-only work remain CPU-based."
+                )
+                with gr.Row():
+                    ai_gpu_selector = gr.Dropdown(
+                        choices=ai_gpu_choices,
+                        value=settings.ai_gpu_uuid,
+                        label="AI Processing GPU",
+                        info="Used for every DLSS Neural Rendering and Frame Generation operation.",
+                    )
+                    video_gpu_selector = gr.Dropdown(
+                        choices=video_gpu_choices,
+                        value=settings.video_gpu_uuid,
+                        label="Video Processing GPU",
+                        info="Used for FFmpeg H.264, HEVC, and AV1 NVENC encoding only.",
+                    )
+                gpu_status = gr.Markdown(
+                    gpu_warning or "GPU selections are ready.",
+                    elem_id="gpu-selection-status",
+                )
+                gr.Markdown(
+                    "## Settings Presets\n"
+                    "Export every adjustable option from the Image, Video, and Frame "
+                    "Interpolation tabs, or import a preset to apply it everywhere."
+                )
+                with gr.Row():
+                    preset_name = gr.Textbox(
+                        label="Preset name",
+                        placeholder="Cinematic 2",
+                        info="The exported file uses this name; the original name is stored in JSON.",
+                        scale=3,
+                    )
+                    preset_export = gr.DownloadButton(
+                        "Export preset",
+                        value=settings_preset_download,
+                        inputs=preset_name,
+                        variant="primary",
+                        scale=1,
+                    )
+                    preset_import = gr.UploadButton(
+                        "Import preset",
+                        file_count="single",
+                        file_types=[".json"],
+                        type="filepath",
+                        variant="primary",
+                        scale=1,
+                    )
+                preset_status = gr.Markdown(
+                    "",
+                    elem_id="preset-status",
+                )
 
         image_inputs = [
             image_sources,
@@ -1017,6 +1483,57 @@ def build_app() -> gr.Blocks:
             video_rename_mode,
             video_custom_suffix,
         ]
+        frame_interpolation_inputs = [
+            frame_interpolation_sources,
+            frame_interpolation_target_fps,
+            frame_interpolation_engine,
+            frame_interpolation_codec,
+            frame_interpolation_container,
+            frame_interpolation_quality,
+            frame_interpolation_rename_mode,
+            frame_interpolation_custom_suffix,
+        ]
+        frame_interpolation_preview_inputs = [
+            frame_interpolation_sources,
+            frame_interpolation_target_fps,
+            frame_interpolation_engine,
+            frame_interpolation_codec,
+            frame_interpolation_container,
+            frame_interpolation_quality,
+        ]
+        frame_interpolation_settings_inputs = [
+            frame_interpolation_target_fps,
+            frame_interpolation_engine,
+            frame_interpolation_codec,
+            frame_interpolation_container,
+            frame_interpolation_quality,
+            frame_interpolation_rename_mode,
+            frame_interpolation_custom_suffix,
+        ]
+        settings_component_outputs = [
+            *image_neural,
+            image_model_preset,
+            *video_neural,
+            video_model_preset,
+            image_format,
+            image_quality,
+            image_rename_mode,
+            image_custom_suffix,
+            video_codec,
+            video_container,
+            video_quality,
+            video_rename_mode,
+            video_custom_suffix,
+            frame_interpolation_target_fps,
+            frame_interpolation_engine,
+            frame_interpolation_codec,
+            frame_interpolation_container,
+            frame_interpolation_quality,
+            frame_interpolation_rename_mode,
+            frame_interpolation_custom_suffix,
+            ai_gpu_selector,
+            video_gpu_selector,
+        ]
 
         image_sources.change(
             preview_input_images,
@@ -1037,6 +1554,22 @@ def build_app() -> gr.Blocks:
             queue=False,
             show_progress="hidden",
         )
+        frame_interpolation_sources.change(
+            update_frame_interpolation_preview_mode,
+            inputs=[
+                frame_interpolation_sources,
+                frame_interpolation_target_fps,
+                frame_interpolation_engine,
+            ],
+            outputs=[
+                frame_interpolation_input_preview,
+                frame_interpolation_output_video,
+                frame_interpolation_preview,
+                frame_interpolation_plan,
+            ],
+            queue=False,
+            show_progress="hidden",
+        )
         image_rename_mode.change(
             rename_suffix_update,
             inputs=image_rename_mode,
@@ -1049,6 +1582,24 @@ def build_app() -> gr.Blocks:
             outputs=video_custom_suffix,
             queue=False,
         )
+        frame_interpolation_rename_mode.change(
+            rename_suffix_update,
+            inputs=frame_interpolation_rename_mode,
+            outputs=frame_interpolation_custom_suffix,
+            queue=False,
+        )
+        for component in [frame_interpolation_target_fps, frame_interpolation_engine]:
+            component.change(
+                describe_frame_interpolation_plan,
+                inputs=[
+                    frame_interpolation_sources,
+                    frame_interpolation_target_fps,
+                    frame_interpolation_engine,
+                ],
+                outputs=frame_interpolation_plan,
+                queue=False,
+                show_progress="hidden",
+            )
         for component in image_settings_inputs:
             component.input(
                 persist_image_settings,
@@ -1063,21 +1614,69 @@ def build_app() -> gr.Blocks:
                 outputs=[*image_neural, image_model_preset],
                 queue=False,
             )
+        for component in frame_interpolation_settings_inputs:
+            component.input(
+                persist_frame_interpolation_settings,
+                inputs=frame_interpolation_settings_inputs,
+                queue=False,
+            )
 
-        image_gpu.input(persist_gpu, inputs=image_gpu, outputs=video_gpu, queue=False)
-        video_gpu.input(persist_gpu, inputs=video_gpu, outputs=image_gpu, queue=False)
-        image_gpu_refresh.click(
-            refresh_gpus, inputs=image_gpu, outputs=image_gpu, queue=False
-        )
-        video_gpu_refresh.click(
-            refresh_gpus, inputs=video_gpu, outputs=video_gpu, queue=False
-        )
-        video_dual_gpu.input(
-            persist_dual_gpu_encode,
-            inputs=video_dual_gpu,
-            outputs=video_dual_gpu,
+        preset_export.click(
+            settings_preset_export_status,
+            inputs=preset_name,
+            outputs=preset_status,
             queue=False,
         )
+        preset_import_event = preset_import.upload(
+            apply_settings_preset,
+            inputs=[preset_import, preset_name],
+            outputs=[preset_name, *settings_component_outputs, preset_status],
+            queue=False,
+        )
+        preset_import_event.then(
+            persist_gpu_settings,
+            inputs=[ai_gpu_selector, video_gpu_selector],
+            outputs=gpu_status,
+            queue=False,
+        ).then(
+            frame_interpolation_capability_text,
+            outputs=frame_interpolation_capabilities,
+            queue=False,
+            show_progress="hidden",
+        ).then(
+            describe_frame_interpolation_plan,
+            inputs=[
+                frame_interpolation_sources,
+                frame_interpolation_target_fps,
+                frame_interpolation_engine,
+            ],
+            outputs=frame_interpolation_plan,
+            queue=False,
+            show_progress="hidden",
+        )
+
+        for selector in [ai_gpu_selector, video_gpu_selector]:
+            selector.input(
+                persist_gpu_settings,
+                inputs=[ai_gpu_selector, video_gpu_selector],
+                outputs=gpu_status,
+                queue=False,
+            ).then(
+                frame_interpolation_capability_text,
+                outputs=frame_interpolation_capabilities,
+                queue=False,
+                show_progress="hidden",
+            ).then(
+                describe_frame_interpolation_plan,
+                inputs=[
+                    frame_interpolation_sources,
+                    frame_interpolation_target_fps,
+                    frame_interpolation_engine,
+                ],
+                outputs=frame_interpolation_plan,
+                queue=False,
+                show_progress="hidden",
+            )
 
         image_render.click(
             render_image_batch,
@@ -1113,28 +1712,39 @@ def build_app() -> gr.Blocks:
         )
         video_stop.click(cancel_active_job, outputs=video_status, queue=False)
 
+        frame_interpolation_render.click(
+            render_frame_interpolation_batch,
+            inputs=frame_interpolation_inputs,
+            outputs=[
+                frame_interpolation_output_video,
+                frame_interpolation_output_files,
+                frame_interpolation_results,
+                frame_interpolation_status,
+            ],
+            concurrency_limit=1,
+        )
+        frame_interpolation_preview.click(
+            preview_frame_interpolation,
+            inputs=frame_interpolation_preview_inputs,
+            outputs=[frame_interpolation_output_video, frame_interpolation_status],
+            concurrency_limit=1,
+        )
+        frame_interpolation_stop.click(
+            cancel_active_job, outputs=frame_interpolation_status, queue=False
+        )
+
         reset_outputs = [
-            *image_neural,
-            image_model_preset,
-            *video_neural,
-            video_model_preset,
-            image_format,
-            image_quality,
-            image_rename_mode,
-            image_custom_suffix,
-            video_codec,
-            video_container,
-            video_quality,
-            video_rename_mode,
-            video_custom_suffix,
-            image_gpu,
-            video_gpu,
-            video_dual_gpu,
+            *settings_component_outputs,
             image_status,
             video_status,
+            frame_interpolation_status,
+            gpu_status,
         ]
         image_reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
         video_reset.click(reset_saved_settings, outputs=reset_outputs, queue=False)
+        frame_interpolation_reset.click(
+            reset_saved_settings, outputs=reset_outputs, queue=False
+        )
     return demo
 
 

@@ -15,9 +15,9 @@ from .runtime import (
     NEURAL_RUNTIME,
     RUNTIME,
     WORKER,
-    detect_gpu,
+    detect_gpus,
     inspect_runtime_bundle,
-    validate_gpu_runtime,
+    resolve_runtime_ai_gpu,
     validate_runtime_files,
 )
 
@@ -27,6 +27,7 @@ class PreparedRuntime:
     """Reusable, source-independent state prepared once for this process."""
 
     gpu: dict[str, Any]
+    gpus: tuple[dict[str, Any], ...]
     runtime_bundle: dict[str, Any]
     encoder_inventory: dict[str, bool]
     warmed_files: tuple[str, ...]
@@ -89,9 +90,9 @@ def prepare_runtime() -> PreparedRuntime:
             return _PREPARED
 
         validate_runtime_files()
-        gpu = detect_gpu()
+        gpus = detect_gpus()
         runtime_bundle = inspect_runtime_bundle()
-        validate_gpu_runtime(gpu, runtime_bundle)
+        gpu = resolve_runtime_ai_gpu(gpus, runtime_bundle)
         inventory = _encoder_inventory()
 
         # Initialize Pillow's reusable sRGB profile and optional image backends.
@@ -121,6 +122,7 @@ def prepare_runtime() -> PreparedRuntime:
 
         _PREPARED = PreparedRuntime(
             gpu=dict(gpu),
+            gpus=tuple(dict(device) for device in gpus),
             runtime_bundle=runtime_bundle,
             encoder_inventory=inventory,
             warmed_files=tuple(str(path.resolve()) for path in paths),

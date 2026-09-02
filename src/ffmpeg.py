@@ -11,7 +11,7 @@ from pathlib import Path
 
 import av
 
-from .runtime import FFMPEG, FFPROBE, JobController, drain_text
+from .runtime import FFMPEG, FFPROBE, JobController, drain_text, query_free_vram_mb
 
 
 ENCODING_QUALITIES = ("Auto (Default)", "Max", "Best", "Good")
@@ -147,8 +147,17 @@ def probe_video(
         frame_count_source = "metadata" if frames > 0 else "unavailable"
     if count_mode == "exact" and frames <= 0:
         raise ValueError("Could not determine an exact frame count for this video.")
-    rate_text = stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "30/1"
+    average_rate_text = stream.get("avg_frame_rate") or "0/0"
+    nominal_rate_text = stream.get("r_frame_rate") or "0/0"
+    rate_text = average_rate_text if average_rate_text != "0/0" else nominal_rate_text
+    if rate_text == "0/0":
+        rate_text = "30/1"
     rate = Fraction(rate_text) if rate_text != "0/0" else Fraction(30, 1)
+    nominal_rate = (
+        Fraction(nominal_rate_text)
+        if nominal_rate_text != "0/0"
+        else rate
+    )
     transfer = stream.get("color_transfer") or "unknown"
     return {
         "width": width,
@@ -160,6 +169,8 @@ def probe_video(
         "frame_count_source": frame_count_source,
         "fps": float(rate),
         "rate": rate,
+        "nominal_rate": nominal_rate,
+        "cfr": rate == nominal_rate,
         "time_base": Fraction(stream.get("time_base") or "1/1000"),
         "duration": float(
             (data.get("format") or {}).get("duration") or stream.get("duration") or 0
@@ -171,10 +182,11 @@ def probe_video(
     }
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)
 def _encoder_probe(
-    codec: str, width: int, height: int, gpu_uuid: str | None = None
+    codec: str, width: int, height: int, gpu_ordinal: int | None = None
 ) -> bool:
+    gpu_args = ["-gpu", str(gpu_ordinal)] if gpu_ordinal is not None else []
     command = [
         str(FFMPEG),
         "-v",
@@ -187,22 +199,85 @@ def _encoder_probe(
         "1",
         "-c:v",
         codec,
+        *gpu_args,
         "-f",
         "null",
         "-",
     ]
-    env = None
-    if gpu_uuid:
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu_uuid
     return (
         subprocess.run(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=env,
         ).returncode
         == 0
+    )
+
+
+_NVENC_CODECS = {
+    "H.264": "h264_nvenc",
+    "HEVC": "hevc_nvenc",
+    "AV1": "av1_nvenc",
+}
+
+
+def probe_nvenc_codecs(gpu_ordinal: int) -> tuple[str, ...]:
+    """Return user-facing codecs that can initialize NVENC on one CUDA device."""
+    return tuple(
+        codec
+        for codec, encoder in _NVENC_CODECS.items()
+        if _encoder_probe(encoder, 256, 256, int(gpu_ordinal))
+    )
+
+
+MIN_SECONDARY_ENCODE_FREE_MB = 2048
+
+
+def resolve_video_gpu(
+    gpus: tuple[dict, ...],
+    gpu_uuid: str,
+    codec: str,
+    width: int,
+    height: int,
+    prefer_not_uuid: str | None = None,
+) -> dict | None:
+    """Resolve a stable UUID to a device that supports the requested NVENC codec.
+
+    With an automatic selection and several cards, a card other than
+    ``prefer_not_uuid`` (the AI processing GPU) is preferred when it has
+    enough free VRAM, so encoding does not compete with the DLSS render.
+    """
+    if codec == "ProRes Proxy":
+        return None
+    try:
+        encoder = _NVENC_CODECS[codec]
+    except KeyError as exc:
+        raise ValueError(f"Unknown video codec: {codec!r}.") from exc
+    candidates = [gpu for gpu in gpus if gpu.get("cuda_ordinal") is not None]
+    if gpu_uuid != "auto":
+        candidates = [gpu for gpu in candidates if gpu.get("uuid") == gpu_uuid]
+        if not candidates:
+            raise RuntimeError("The selected Video Processing GPU is unavailable.")
+    elif prefer_not_uuid is not None and len(candidates) > 1:
+        free_vram = query_free_vram_mb()
+        secondary = [
+            gpu
+            for gpu in candidates
+            if gpu.get("uuid") != prefer_not_uuid
+            and free_vram.get(str(gpu.get("uuid")), 0) >= MIN_SECONDARY_ENCODE_FREE_MB
+        ]
+        remainder = [gpu for gpu in candidates if gpu not in secondary]
+        candidates = [*secondary, *remainder]
+    for gpu in candidates:
+        ordinal = int(gpu["cuda_ordinal"])
+        if _encoder_probe(encoder, width, height, ordinal):
+            selected = dict(gpu)
+            selected["nvenc_codec"] = encoder
+            return selected
+    selection = "selected GPU" if gpu_uuid != "auto" else "available NVIDIA GPUs"
+    raise RuntimeError(
+        f"{codec} NVENC cannot encode the requested {width}×{height} output on the "
+        f"{selection}. Choose another Video Processing GPU, codec, or output size."
     )
 
 
@@ -212,7 +287,8 @@ def _codec_command(
     width: int,
     height: int,
     fps: float,
-    gpu_uuid: str | None = None,
+    gpu_ordinal: int | None = None,
+    require_nvenc: bool = False,
 ) -> tuple[list[str], str, dict]:
     quality = resolve_encoding_quality(quality_name, codec, width, height, fps)
     if codec == "ProRes Proxy":
@@ -228,12 +304,14 @@ def _codec_command(
         bitrate = f"{quality['target_bitrate_kbps']}k"
         nvenc_quality = ["-rc", "vbr", "-b:v", bitrate]
         software_quality = ["-b:v", bitrate]
+    gpu_args = ["-gpu", str(gpu_ordinal)] if gpu_ordinal is not None else []
     if codec == "H.264":
-        if _encoder_probe("h264_nvenc", width, height, gpu_uuid):
+        if _encoder_probe("h264_nvenc", width, height, gpu_ordinal):
             return (
                 [
                     "-c:v",
                     "h264_nvenc",
+                    *gpu_args,
                     "-preset",
                     "p6",
                     "-tune",
@@ -245,17 +323,22 @@ def _codec_command(
                 "h264_nvenc",
                 quality,
             )
+        if require_nvenc:
+            raise RuntimeError(
+                f"H.264 NVENC cannot encode {width}×{height} on the selected Video Processing GPU."
+            )
         return (
             ["-c:v", "libx264", "-preset", "slow", *software_quality, "-pix_fmt", "yuv420p"],
             "libx264",
             quality,
         )
     if codec == "HEVC":
-        if _encoder_probe("hevc_nvenc", width, height, gpu_uuid):
+        if _encoder_probe("hevc_nvenc", width, height, gpu_ordinal):
             return (
                 [
                     "-c:v",
                     "hevc_nvenc",
+                    *gpu_args,
                     "-preset",
                     "p6",
                     "-tune",
@@ -267,6 +350,10 @@ def _codec_command(
                 "hevc_nvenc",
                 quality,
             )
+        if require_nvenc:
+            raise RuntimeError(
+                f"HEVC NVENC cannot encode {width}×{height} on the selected Video Processing GPU."
+            )
         return (
             ["-c:v", "libx265", "-preset", "slow", *software_quality, "-pix_fmt", "yuv420p"],
             "libx265",
@@ -274,13 +361,16 @@ def _codec_command(
         )
     if codec != "AV1":
         raise ValueError(f"Unknown video codec: {codec!r}.")
-    if not _encoder_probe("av1_nvenc", width, height, gpu_uuid):
+    if not _encoder_probe("av1_nvenc", width, height, gpu_ordinal):
         raise RuntimeError(
             f"AV1 NVENC cannot encode the requested {width}×{height} output on this GPU/driver. "
             "Choose H.264/HEVC or a lower upscaling factor."
         )
     return (
-        ["-c:v", "av1_nvenc", "-preset", "p6", *nvenc_quality, "-pix_fmt", "yuv420p"],
+        [
+            "-c:v", "av1_nvenc", *gpu_args, "-preset", "p6", *nvenc_quality,
+            "-pix_fmt", "yuv420p",
+        ],
         "av1_nvenc",
         quality,
     )
@@ -294,21 +384,12 @@ def start_encoder(
     width: int,
     height: int,
     fps: float,
-    encode_gpu: dict | None = None,
+    gpu_ordinal: int | None = None,
+    require_nvenc: bool = False,
 ):
-    env = None
-    gpu_uuid = None
-    if encode_gpu and encode_gpu.get("uuid"):
-        # Pin NVENC (a CUDA context underneath) to the chosen card; probing uses
-        # the same device so the fallback decision matches the real encode.
-        gpu_uuid = str(encode_gpu["uuid"])
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = gpu_uuid
     codec_args, selected, quality = _codec_command(
-        codec, quality_name, width, height, fps, gpu_uuid
+        codec, quality_name, width, height, fps, gpu_ordinal, require_nvenc
     )
-    if env is not None and selected.endswith("_nvenc"):
-        selected = f"{selected} on {encode_gpu['name']}"
     command = [
         str(FFMPEG),
         "-hide_banner",
@@ -332,7 +413,6 @@ def start_encoder(
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        env=env,
     )
     controller.register(process)
     logs: list[str] = []
@@ -381,6 +461,7 @@ def final_mux(
     output: Path,
     container: str,
     controller: JobController | None = None,
+    preserve_supported_subtitles: bool = False,
 ) -> None:
     duration = _probe_rendered_duration(temp_video)
     if container == "MKV":
@@ -398,6 +479,31 @@ def final_mux(
             "-movflags",
             "+faststart",
         ]
+        if preserve_supported_subtitles:
+            subtitle_data = _run_json(
+                [
+                    str(FFPROBE),
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "s",
+                    "-show_entries",
+                    "stream=index,codec_name",
+                    "-of",
+                    "json",
+                    str(source),
+                ]
+            )
+            supported_text = {"ass", "ssa", "subrip", "mov_text", "webvtt", "text"}
+            subtitle_indices = [
+                int(stream["index"])
+                for stream in subtitle_data.get("streams") or []
+                if stream.get("codec_name") in supported_text
+            ]
+            for stream_index in subtitle_indices:
+                maps.extend(["-map", f"1:{stream_index}"])
+            if subtitle_indices:
+                streams.extend(["-c:s", "mov_text"])
     command = [
         str(FFMPEG),
         "-hide_banner",

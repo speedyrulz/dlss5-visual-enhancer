@@ -28,6 +28,7 @@ from .runtime import (
     DLSSFrameSession,
     active_job,
     resize_fit,
+    resolve_runtime_ai_gpu,
     validate_gpu_runtime,
     verify_feature_18,
     write_failure_report,
@@ -60,6 +61,7 @@ RAW_EXTENSIONS = {
 
 @dataclass(slots=True)
 class ImageConversionOptions:
+    ai_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
     local_tone_strength: float = 1.0
@@ -78,6 +80,7 @@ class ImageConversionOptions:
 
     def neural_options(self) -> ConversionOptions:
         return ConversionOptions(
+            ai_gpu_uuid=self.ai_gpu_uuid,
             nr_preset=self.nr_preset,
             nr_style=self.nr_style,
             nr_intensity=self.nr_intensity,
@@ -613,7 +616,9 @@ def convert_images(
     decode_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dlss5-image-decode")
     encode_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dlss5-image-encode")
     with active_job() as controller:
-        gpu = dict(prepared_runtime.gpu)
+        gpu = resolve_runtime_ai_gpu(
+            prepared_runtime.gpus, prepared_runtime.runtime_bundle, options.ai_gpu_uuid
+        )
         runtime_bundle = prepared_runtime.runtime_bundle
         try:
             validate_gpu_runtime(gpu, runtime_bundle)

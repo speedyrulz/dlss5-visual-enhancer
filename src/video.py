@@ -20,9 +20,6 @@ import numpy as np
 from . import ffmpeg
 from .naming import output_filename, require_available_output, validate_rename
 from .runtime import (
-    detect_gpu,
-    list_gpus,
-    validate_gpu_runtime,
     JOBS,
     LOGS,
     OUTPUTS,
@@ -30,6 +27,7 @@ from .runtime import (
     DLSSFrameSession,
     active_job,
     resize_fit,
+    resolve_runtime_ai_gpu,
     rotate_frame,
     verify_feature_18,
     write_failure_report,
@@ -45,6 +43,8 @@ validate_codec_container = ffmpeg.validate_codec_container
 
 @dataclass(slots=True)
 class ConversionOptions:
+    ai_gpu_uuid: str = "auto"
+    video_gpu_uuid: str = "auto"
     nr_style: str = "Default"
     nr_intensity: float = 1.0
     local_tone_strength: float = 1.0
@@ -63,10 +63,7 @@ class ConversionOptions:
     rename_mode: str = "Auto"
     custom_suffix: str = "_DLSS5"
     dlss_model_preset: str = "Default"
-    dual_gpu_encode: bool = True
 
-
-MIN_ENCODE_GPU_FREE_MB = 2048
 
 NR_PRESETS = {
     "Default": 0,
@@ -388,12 +385,16 @@ def convert_video(
         output: Path | None = None
         session: DLSSFrameSession | None = None
         encoder_failure_logs: list[str] = []
-        # Detect fresh instead of reusing the prepared GPU: the user's GPU
-        # selection can change between renders, and the session later corrects
-        # this to whichever adapter the worker really bound.
-        gpu: dict | None = detect_gpu()
+        gpu: dict | None = dict(
+            resolve_runtime_ai_gpu(
+                prepared_runtime.gpus,
+                prepared_runtime.runtime_bundle,
+                options.ai_gpu_uuid,
+            )
+        )
+        gpu["requested"] = options.ai_gpu_uuid != "auto"
+        video_gpu: dict | None = None
         runtime_bundle: dict | None = prepared_runtime.runtime_bundle
-        validate_gpu_runtime(gpu, runtime_bundle)
         encoder = None
         encoder_setup_thread: threading.Thread | None = None
         producer_thread: threading.Thread | None = None
@@ -431,6 +432,14 @@ def convert_video(
             output_width, output_height = resolve_output_size(
                 input_width, input_height, factor
             )
+            video_gpu = ffmpeg.resolve_video_gpu(
+                prepared_runtime.gpus,
+                options.video_gpu_uuid,
+                "H.264" if is_preview else options.codec,
+                output_width,
+                output_height,
+                prefer_not_uuid=gpu.get("uuid"),
+            )
             OUTPUTS.mkdir(exist_ok=True)
             LOGS.mkdir(exist_ok=True)
             JOBS.mkdir(exist_ok=True)
@@ -462,11 +471,10 @@ def convert_video(
             temp_video = job_dir / "processed-video.mkv"
             native = resolve_native_settings(options)
             if progress:
-                progress(0.01, "Starting feature 18 (the native worker picks the adapter)")
+                progress(0.01, f"Starting feature 18 on {gpu['display_name']}")
 
             encoder_setup: list[tuple] = []
             encoding_stage_started = time.perf_counter()
-            encode_gpu: dict | None = None
 
             def prepare_encoder() -> None:
                 encoder_started = time.perf_counter()
@@ -480,7 +488,8 @@ def convert_video(
                             output_width,
                             output_height,
                             float(metadata["fps"]),
-                            encode_gpu=encode_gpu,
+                            None if video_gpu is None else int(video_gpu["cuda_ordinal"]),
+                            video_gpu is not None,
                         )
                     )
                 except BaseException as exc:
@@ -490,14 +499,10 @@ def convert_video(
                         time.perf_counter() - encoder_started
                     )
 
-            # With two cards the encoder must wait for the worker handshake to
-            # learn the render adapter, so NVENC can run on the other card.
-            defer_encoder = options.dual_gpu_encode and len(list_gpus()) > 1
-            if not defer_encoder:
-                encoder_setup_thread = threading.Thread(
-                    target=prepare_encoder, name="dlss5-encoder-setup", daemon=True
-                )
-                encoder_setup_thread.start()
+            encoder_setup_thread = threading.Thread(
+                target=prepare_encoder, name="dlss5-encoder-setup", daemon=True
+            )
+            encoder_setup_thread.start()
             session_started = time.perf_counter()
             session = DLSSFrameSession(
                 input_width=input_width,
@@ -514,39 +519,7 @@ def convert_video(
                 controller=controller,
             )
             timings["native_setup_seconds"] = time.perf_counter() - session_started
-            if defer_encoder:
-                bound = str(gpu.get("bound_adapter") or gpu["name"]).casefold()
-                encode_gpu = next(
-                    (
-                        entry
-                        for entry in list_gpus()
-                        if entry["name"].casefold() != bound
-                    ),
-                    None,
-                )
-                if encode_gpu is not None and (
-                    int(encode_gpu.get("memory_free_mb", 0)) < MIN_ENCODE_GPU_FREE_MB
-                ):
-                    # An NVENC session that cannot allocate dies mid-encode and
-                    # takes the whole render with it; stay on the render GPU.
-                    if progress:
-                        progress(
-                            0.02,
-                            f"Dual GPU skipped: {encode_gpu['name']} has only "
-                            f"{encode_gpu.get('memory_free_mb', 0)} MB VRAM free "
-                            f"(needs {MIN_ENCODE_GPU_FREE_MB} MB); encoding on "
-                            f"{gpu['display_name']}",
-                        )
-                    encode_gpu = None
-                elif encode_gpu is not None and progress:
-                    progress(
-                        0.02,
-                        f"Dual GPU: rendering on {gpu['display_name']}, "
-                        f"encoding on {encode_gpu['name']}",
-                    )
-                prepare_encoder()
-            else:
-                encoder_setup_thread.join()
+            encoder_setup_thread.join()
             encoder_setup_thread = None
             timings["setup_seconds"] = max(
                 timings["native_setup_seconds"],
@@ -677,7 +650,6 @@ def convert_video(
                                     or "It produced no output."
                                 )
                             ) from mux_exc
-
                     while not pipeline_stop.is_set():
                         if controller.cancel.is_set():
                             raise Cancelled("Render stopped by user.")
@@ -876,6 +848,8 @@ def convert_video(
                     for key, value in verified.items()
                 },
                 "gpu": gpu,
+                "ai_gpu": gpu,
+                "video_gpu": video_gpu,
                 "encoder": selected_encoder,
                 "encoding_quality": encoding_quality,
                 "frames_processed": delivered,
