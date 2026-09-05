@@ -53,9 +53,13 @@ class DLSSGGuideGenerator:
                 )
                 calculated[..., 0] *= self.width / self.flow_width
                 calculated[..., 1] *= self.height / self.flow_height
-                finite = np.isfinite(calculated).all(axis=2)
+                # Reducing an H×W×2 boolean array along its tiny last axis is
+                # expensive. These two channel checks produce the same mask.
+                finite = np.isfinite(calculated[..., 0])
+                np.logical_and(finite, np.isfinite(calculated[..., 1]), out=finite)
                 confidence = float(np.mean(finite))
-                calculated[~finite] = 0
+                if confidence < 1.0:
+                    calculated[~finite] = 0
                 reset = confidence < 0.98
                 vectors = self.zero if reset else np.ascontiguousarray(calculated.astype(np.float16))
             guide = Guide(vectors, reset, score, duplicate, confidence)

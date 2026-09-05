@@ -1,11 +1,11 @@
 """Portable DLSS 5 Visual Enhancer for images and video."""
 
-from .ffmpeg import probe_video
-from .images import (
+from .core.ffmpeg import probe_video
+from .image import (
     ImageBatchResult,
+    ImageConversionFailure,
     ImageConversionOptions,
     ImageConversionResult,
-    ImageConversionFailure,
     convert_image,
     convert_images,
     probe_image,

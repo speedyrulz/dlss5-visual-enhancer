@@ -13,7 +13,14 @@ FPS_RATES: dict[str, Fraction] = {
     "59.94": Fraction(60000, 1001),
     "60": Fraction(60, 1),
     "90": Fraction(90, 1),
+    "119.88": Fraction(120000, 1001),
     "120": Fraction(120, 1),
+    "144": Fraction(144, 1),
+    "165": Fraction(165, 1),
+    "180": Fraction(180, 1),
+    "240": Fraction(240, 1),
+    "360": Fraction(360, 1),
+    "480": Fraction(480, 1),
 }
 FPS_CHOICES = tuple(FPS_RATES)
 ENGINE_CHOICES = ("Auto", "Native DLSSG", "Cascade")
@@ -43,9 +50,13 @@ class FrameInterpolationOptions:
     codec: str = "H.264"
     container: str = "MP4"
     quality: str = "Auto (Default)"
+    hdr_mode: bool = False
     rename_mode: str = "Auto"
     custom_suffix: str = "_DLSSFG"
     preview_seconds: float | None = None
+    # True = truncated preview uses the forced H.264 SDR path (current behavior).
+    # False = truncated preview uses the user's codec/container (HDR preserved).
+    preview_compat: bool = True
 
     @property
     def target_rate(self) -> Fraction:
@@ -62,7 +73,6 @@ class FrameInterpolationCapabilities:
     native_multiplier: int
     cascade_available: bool
     runtime_version: str
-    runtime_sha256: str
     worker_version: str
     signature_status: str
     detail: str = ""

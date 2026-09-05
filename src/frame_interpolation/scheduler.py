@@ -6,9 +6,6 @@ from fractions import Fraction
 from .models import ENGINE_CHOICES, InterpolationPlan
 
 
-MAX_OUTPUT_MULTIPLIER = Fraction(6, 1)
-
-
 def output_frame_count(duration: Fraction, target_rate: Fraction) -> int:
     """Count timestamps n/rate in the half-open interval [0, duration)."""
     if duration <= 0 or target_rate <= 0:
@@ -45,10 +42,6 @@ def choose_interpolation_plan(
     if source_rate <= 0 or target_rate <= 0:
         raise ValueError("Source and output FPS must be positive.")
     ratio = target_rate / source_rate
-    if ratio > MAX_OUTPUT_MULTIPLIER:
-        raise ValueError(
-            f"Requested {float(ratio):.3f}× output exceeds the safe 6× limit for this file."
-        )
     if target_rate <= source_rate:
         return InterpolationPlan(
             path="Source-frame resampling",

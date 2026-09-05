@@ -1,32 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import subprocess
 from functools import lru_cache
 from pathlib import Path
 
-from ..runtime import ROOT, detect_gpu
+from ..core.paths import DLSSG_DIR
+from ..core.gpu_selection import detect_gpu
 from .models import FrameInterpolationCapabilities
 
 
-RUNTIME_DIR = ROOT / "bin" / "runtime" / "frame_interpolation" / "dlssg"
+RUNTIME_DIR = DLSSG_DIR
 DLSSG_RUNTIME = RUNTIME_DIR / "nvngx_dlssg.dll"
 DLSSG_WORKER = RUNTIME_DIR / "dlssg-worker.exe"
-MANIFEST = RUNTIME_DIR / "manifest.json"
-EXPECTED_RUNTIME_SHA256 = "135EAF0733C1E37381A8C28ABCF7A862404A54132B81787C04E35D09EFC5E36F"
-EXPECTED_WORKER_SHA256 = "8A747F9ED613842D5B8B34A811AD43BC1A9466540E2E5A0C8EF4005F0DB9E384"
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest().upper()
-
-
 def _hags_enabled() -> bool:
     if os.name != "nt":
         return False
@@ -69,12 +56,10 @@ def _authenticode_status(path: Path) -> str:
     return process.stdout.strip() if process.returncode == 0 else "Unavailable"
 
 
-def _probe_worker(adapter_luid: str | None = None) -> dict:
+def _probe_worker() -> dict:
     if not DLSSG_WORKER.is_file():
         raise RuntimeError(f"DLSSG worker is missing: {DLSSG_WORKER}")
     command = [str(DLSSG_WORKER), "--probe"]
-    if adapter_luid:
-        command.extend(["--adapter-luid", adapter_luid])
     process = subprocess.run(
         command,
         cwd=str(RUNTIME_DIR),
@@ -103,34 +88,41 @@ def probe_frame_interpolation_capabilities(
     hags = _hags_enabled()
     if not DLSSG_RUNTIME.is_file():
         return FrameInterpolationCapabilities(
-            False, gpu_name, driver, hags, 0, 1, False, "missing", "", "missing",
-            "Missing", f"Signed NVIDIA DLSSG runtime is missing: {DLSSG_RUNTIME}",
+            available=False,
+            gpu=gpu_name,
+            driver=driver,
+            hags_enabled=hags,
+            native_generated_frame_max=0,
+            native_multiplier=1,
+            cascade_available=False,
+            runtime_version="missing",
+            worker_version="missing",
+            signature_status="Missing",
+            detail=f"NVIDIA DLSSG runtime is missing: {DLSSG_RUNTIME}",
+            gpu_uuid=str(gpu.get("uuid") or ai_gpu_uuid),
         )
-    runtime_hash = _sha256(DLSSG_RUNTIME)
+    if not DLSSG_WORKER.is_file():
+        return FrameInterpolationCapabilities(
+            available=False,
+            gpu=gpu_name,
+            driver=driver,
+            hags_enabled=hags,
+            native_generated_frame_max=0,
+            native_multiplier=1,
+            cascade_available=False,
+            runtime_version="unknown",
+            worker_version="missing",
+            signature_status=_authenticode_status(DLSSG_RUNTIME),
+            detail=f"Direct D3D12 DLSSG worker is missing: {DLSSG_WORKER}",
+            gpu_uuid=str(gpu.get("uuid") or ai_gpu_uuid),
+        )
+
     signature_status = _authenticode_status(DLSSG_RUNTIME)
-    if runtime_hash != EXPECTED_RUNTIME_SHA256:
-        return FrameInterpolationCapabilities(
-            False, gpu_name, driver, hags, 0, 1, False, "unknown", runtime_hash,
-            "unknown", "Hash mismatch",
-            "The staged nvngx_dlssg.dll does not match the pinned NVIDIA 310.7 release.",
-        )
-    if signature_status != "Valid":
-        return FrameInterpolationCapabilities(
-            False, gpu_name, driver, hags, 0, 1, False, "310.7.0.0", runtime_hash,
-            "unknown", signature_status,
-            "Windows did not validate the NVIDIA Authenticode signature on nvngx_dlssg.dll.",
-        )
-    if not DLSSG_WORKER.is_file() or _sha256(DLSSG_WORKER) != EXPECTED_WORKER_SHA256:
-        return FrameInterpolationCapabilities(
-            False, gpu_name, driver, hags, 0, 1, False, "310.7.0.0", runtime_hash,
-            "unknown", "Worker hash mismatch",
-            "The direct D3D12 worker is missing or does not match its source build manifest.",
-        )
     try:
-        probed = _probe_worker(gpu.get("adapter_luid"))
+        probed = _probe_worker()
         generated_max = max(0, int(probed.get("multi_frame_count_max", 0)))
         multiplier = generated_max + 1 if generated_max else 1
-        available = bool(probed.get("available", False)) and generated_max >= 1 and hags
+        available = bool(probed.get("available", False)) and generated_max >= 1
         detail = str(probed.get("detail") or "")
     except Exception as exc:
         generated_max = 0
@@ -138,6 +130,17 @@ def probe_frame_interpolation_capabilities(
         available = False
         detail = str(exc)
         probed = {}
+
+    diagnostic_notes: list[str] = []
+    if not hags:
+        diagnostic_notes.append("HAGS is disabled; the native runtime may reject Frame Generation.")
+    if signature_status not in {"Valid", "Unavailable"}:
+        diagnostic_notes.append(
+            f"Authenticode status is {signature_status}; this is diagnostic only and is not blocked."
+        )
+    if diagnostic_notes:
+        detail = " ".join([part for part in [detail, *diagnostic_notes] if part])
+
     return FrameInterpolationCapabilities(
         available=available,
         gpu=gpu_name,
@@ -146,10 +149,9 @@ def probe_frame_interpolation_capabilities(
         native_generated_frame_max=generated_max,
         native_multiplier=multiplier,
         cascade_available=available and multiplier >= 2,
-        runtime_version=str(probed.get("runtime_version") or "310.7.0.0"),
-        runtime_sha256=runtime_hash,
-        worker_version=str(probed.get("worker_version") or "1"),
-        signature_status=f"{signature_status} (NVIDIA; pinned hash)",
+        runtime_version=str(probed.get("runtime_version") or "unknown"),
+        worker_version=str(probed.get("worker_version") or "unknown"),
+        signature_status=signature_status,
         detail=detail,
         gpu_uuid=str(gpu.get("uuid") or ai_gpu_uuid),
     )

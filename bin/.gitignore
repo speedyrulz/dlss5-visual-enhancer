@@ -1,0 +1,22 @@
+# Binaries are distributed via GitHub Releases, not git (several exceed
+# GitHub's 100 MB per-file push limit). Keep only docs and license texts.
+*.exe
+*.dll
+*.addon64
+*.pyd
+*.zip
+*.7z
+*.pth
+__pycache__/
+
+# Keep these committable companions next to the (ignored) binaries.
+!BINARIES.md
+!LICENSE
+!LICENSE-*.txt
+!LICENSE.GPL
+!LICENSE.LGPL
+!THIRD_PARTY_LICENSES.txt
+!Copyright
+!README.txt
+!.gitkeep
+!.gitignore

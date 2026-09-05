@@ -8,7 +8,7 @@ from fractions import Fraction
 
 import numpy as np
 
-from ..runtime import Cancelled, JobController
+from ..core.jobs import Cancelled, JobController
 from .capabilities import DLSSG_WORKER, RUNTIME_DIR
 
 
@@ -18,14 +18,30 @@ FRAME_MAGIC = 0x31464746
 FRAME_OUT_MAGIC = 0x314F4746
 
 
-def _read_exact(stream, size: int) -> bytes:
-    data = bytearray()
-    while len(data) < size:
-        block = stream.read(size - len(data))
-        if not block:
+def _read_into_exact(stream, destination) -> None:
+    view = memoryview(destination).cast("B")
+    offset = 0
+    while offset < len(view):
+        count = stream.readinto(view[offset:])
+        if not count:
             raise RuntimeError("The direct DLSSG worker closed its output unexpectedly.")
-        data.extend(block)
+        offset += count
+
+
+def _read_exact(stream, size: int) -> bytes:
+    data = bytearray(size)
+    _read_into_exact(stream, data)
     return bytes(data)
+
+
+def _write_all(stream, source) -> None:
+    view = memoryview(source).cast("B")
+    offset = 0
+    while offset < len(view):
+        count = stream.write(view[offset:])
+        if not count:
+            raise RuntimeError("The direct DLSSG worker closed its input unexpectedly.")
+        offset += count
 
 
 class DirectDLSSGSession:
@@ -38,7 +54,6 @@ class DirectDLSSGSession:
         frame_count: int,
         generated_count: int,
         controller: JobController,
-        adapter_luid: str | None = None,
     ) -> None:
         if not DLSSG_WORKER.is_file():
             raise RuntimeError(f"Direct DLSSG worker is missing: {DLSSG_WORKER}")
@@ -49,8 +64,6 @@ class DirectDLSSGSession:
         self.controller = controller
         self.logs: collections.deque[str] = collections.deque(maxlen=300)
         command = [str(DLSSG_WORKER), "--serve"]
-        if adapter_luid:
-            command.extend(["--adapter-luid", adapter_luid])
         self.process = subprocess.Popen(
             command,
             cwd=str(RUNTIME_DIR),
@@ -58,6 +71,7 @@ class DirectDLSSGSession:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         controller.register(self.process)
         assert self.process.stdin is not None
@@ -65,7 +79,18 @@ class DirectDLSSGSession:
         assert self.process.stderr is not None
         self._log_thread = threading.Thread(target=self._read_logs, daemon=True)
         self._log_thread.start()
-        self.process.stdin.write(
+        self.closed = False
+        self._next_index = 0
+        try:
+            self._setup(frame_count)
+        except BaseException:
+            self.abort()
+            self.close()
+            raise
+
+    def _setup(self, frame_count: int) -> None:
+        _write_all(
+            self.process.stdin,
             struct.pack(
                 "<5I",
                 SETUP_MAGIC,
@@ -91,8 +116,6 @@ class DirectDLSSGSession:
                 f"DLSSG worker rejected {self.generated_count} generated frame(s); "
                 f"MultiFrameCountMax is {maximum}."
             )
-        self._next_index = 0
-        self.closed = False
 
     def _read_logs(self) -> None:
         assert self.process.stderr is not None
@@ -122,7 +145,8 @@ class DirectDLSSGSession:
             raise ValueError(f"DLSSG motion field has unexpected shape {vectors.shape}.")
         assert self.process.stdin is not None
         assert self.process.stdout is not None
-        self.process.stdin.write(
+        _write_all(
+            self.process.stdin,
             struct.pack(
                 "<4I2q",
                 FRAME_MAGIC,
@@ -133,8 +157,8 @@ class DirectDLSSGSession:
                 timestamp.denominator,
             )
         )
-        self.process.stdin.write(memoryview(color).cast("B"))
-        self.process.stdin.write(memoryview(vectors).cast("B"))
+        _write_all(self.process.stdin, color)
+        _write_all(self.process.stdin, vectors)
         self.process.stdin.flush()
         self._next_index += 1
         magic, status, generated, disabled = struct.unpack(
@@ -145,14 +169,25 @@ class DirectDLSSGSession:
                 f"DLSSG evaluation failed at input frame {self._next_index - 1} "
                 f"(status {status}).\n{self.log_text()}"
             )
+        if generated > self.generated_count or (disabled and generated):
+            raise RuntimeError("DLSSG worker returned an invalid generated-frame count.")
         if disabled:
             return []
-        return [
-            np.frombuffer(_read_exact(self.process.stdout, self.frame_bytes), np.uint8)
-            .reshape(self.height, self.width, 4)
-            .copy()
-            for _ in range(generated)
-        ]
+        frames = []
+        for _ in range(generated):
+            # Each returned array owns its storage until every downstream user
+            # releases it. Reading into it avoids three full-frame copies.
+            frame = np.empty((self.height, self.width, 4), dtype=np.uint8)
+            _read_into_exact(self.process.stdout, frame)
+            frames.append(frame)
+        return frames
+
+    def abort(self) -> None:
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except OSError:
+                pass
 
     def close(self) -> None:
         if getattr(self, "closed", False):
@@ -172,8 +207,12 @@ class DirectDLSSGSession:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=5)
         self.controller.unregister(process)
         self._log_thread.join(timeout=1)
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
 
     def __enter__(self) -> "DirectDLSSGSession":
         return self
