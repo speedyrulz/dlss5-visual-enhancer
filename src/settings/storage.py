@@ -39,9 +39,21 @@ def load_settings(path: str | os.PathLike[str]) -> UISettings:
                 return migrated
         return value if value in choices else default
 
+    # Configs written before the CPU/NVENC codec split have none of the
+    # v6-only keys. Back then a plain codec name meant "NVENC when available",
+    # so carrying it over verbatim would silently downgrade upgraders to CPU
+    # encoding; map it to the NVENC variant instead.
+    legacy_codec_semantics = not any(
+        marker in section for marker in ("ai_gpu_uuid", "dlss_architecture")
+    )
+
     def codec_choice(key: str, default: str) -> str:
         raw = section.get(key, default)
         migrated = _migrate_codec(raw)
+        if legacy_codec_semantics and key in section:
+            nvenc_variant = f"{migrated} (NVIDIA NVENC)"
+            if nvenc_variant in CODEC_CHOICES:
+                return nvenc_variant
         if migrated in CODEC_CHOICES:
             return migrated
         return default

@@ -25,6 +25,13 @@ def resolve_ai_gpu(gpus: tuple[dict[str, Any], ...], gpu_uuid: str = "auto") -> 
         )
         message = "No supported NVIDIA RTX GPU was detected."
         raise RuntimeError(f"{message} {details}" if details else message)
+    # The native worker binds the first NVIDIA adapter in DXGI enumeration
+    # order, which need not match nvidia-smi's order. Picking that card here
+    # keeps the staged DLSS architecture DLL and the reports consistent with
+    # the GPU that actually renders.
+    ranked = [gpu for gpu in compatible if gpu.get("d3d_adapter_index") is not None]
+    if ranked:
+        return dict(min(ranked, key=lambda gpu: int(gpu["d3d_adapter_index"])))
     return dict(compatible[0])
 
 

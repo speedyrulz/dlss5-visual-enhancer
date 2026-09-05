@@ -69,6 +69,10 @@ def _cuda_device_identities() -> dict[str, dict[str, Any]]:
     cuda.cuDeviceGet.restype = ctypes.c_int
     cuda.cuDeviceGetPCIBusId.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
     cuda.cuDeviceGetPCIBusId.restype = ctypes.c_int
+    get_luid = getattr(cuda, "cuDeviceGetLuid", None)
+    if get_luid is not None:
+        get_luid.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.c_int]
+        get_luid.restype = ctypes.c_int
     if cuda.cuInit(0) != 0:
         return {}
     count = ctypes.c_int()
@@ -82,10 +86,97 @@ def _cuda_device_identities() -> dict[str, dict[str, Any]]:
         bus_buffer = ctypes.create_string_buffer(32)
         if cuda.cuDeviceGetPCIBusId(bus_buffer, len(bus_buffer), device.value) != 0:
             continue
+        luid_hex: str | None = None
+        if get_luid is not None:
+            luid = (ctypes.c_ubyte * 8)()
+            node_mask = ctypes.c_uint()
+            if get_luid(luid, ctypes.byref(node_mask), device.value) == 0:
+                luid_hex = bytes(luid).hex()
         identities[_normalize_pci_bus_id(bus_buffer.value.decode("ascii", "replace"))] = {
             "cuda_ordinal": ordinal,
+            "adapter_luid": luid_hex,
         }
     return identities
+
+
+def _dxgi_adapter_luids() -> list[str]:
+    """Adapter LUIDs in DXGI enumeration order (IDXGIFactory1::EnumAdapters1).
+
+    The native worker creates its D3D12 device on the first NVIDIA adapter
+    DXGI enumerates (the primary display's card comes first), which need not
+    match nvidia-smi's order. This order predicts the GPU that will render.
+    """
+    try:
+        dxgi = ctypes.WinDLL("dxgi")
+    except (AttributeError, OSError):
+        return []
+
+    class _Guid(ctypes.Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_uint32),
+            ("Data2", ctypes.c_uint16),
+            ("Data3", ctypes.c_uint16),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    class _Luid(ctypes.Structure):
+        _fields_ = [("LowPart", ctypes.c_ulong), ("HighPart", ctypes.c_long)]
+
+    class _AdapterDesc1(ctypes.Structure):
+        _fields_ = [
+            ("Description", ctypes.c_wchar * 128),
+            ("VendorId", ctypes.c_uint),
+            ("DeviceId", ctypes.c_uint),
+            ("SubSysId", ctypes.c_uint),
+            ("Revision", ctypes.c_uint),
+            ("DedicatedVideoMemory", ctypes.c_size_t),
+            ("DedicatedSystemMemory", ctypes.c_size_t),
+            ("SharedSystemMemory", ctypes.c_size_t),
+            ("AdapterLuid", _Luid),
+            ("Flags", ctypes.c_uint),
+        ]
+
+    # IID_IDXGIFactory1 = 770aae78-f26f-4dba-a829-253c83d1b387
+    iid = _Guid(0x770AAE78, 0xF26F, 0x4DBA, (ctypes.c_ubyte * 8)(
+        0xA8, 0x29, 0x25, 0x3C, 0x83, 0xD1, 0xB3, 0x87
+    ))
+
+    def _method(instance, index: int, restype, *argtypes):
+        vtable = ctypes.cast(instance, ctypes.POINTER(ctypes.c_void_p))[0]
+        pointer = ctypes.cast(vtable, ctypes.POINTER(ctypes.c_void_p))[index]
+        return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(pointer)
+
+    factory = ctypes.c_void_p()
+    try:
+        if dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0:
+            return []
+    except (AttributeError, OSError):
+        return []
+    order: list[str] = []
+    try:
+        # IDXGIFactory1 vtable: IUnknown(3) + IDXGIObject(4) + IDXGIFactory(5)
+        # puts EnumAdapters1 at slot 12; IDXGIAdapter1::GetDesc1 is slot 10.
+        enum_adapters = _method(
+            factory, 12, ctypes.c_long, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)
+        )
+        position = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if enum_adapters(factory, position, ctypes.byref(adapter)) != 0:
+                break
+            try:
+                description = _AdapterDesc1()
+                get_desc = _method(adapter, 10, ctypes.c_long, ctypes.POINTER(_AdapterDesc1))
+                if get_desc(adapter, ctypes.byref(description)) == 0:
+                    order.append(bytes(description.AdapterLuid).hex())
+                else:
+                    order.append("")
+            finally:
+                _method(adapter, 2, ctypes.c_ulong)(adapter)
+            position += 1
+    finally:
+        _method(factory, 2, ctypes.c_ulong)(factory)
+    return order
 
 
 @lru_cache(maxsize=1)
@@ -180,10 +271,18 @@ def detect_gpus() -> tuple[dict[str, Any], ...]:
                 "cuda_ordinal": (
                     smi_index if legacy_row else identity.get("cuda_ordinal", smi_index)
                 ),
+                "adapter_luid": identity.get("adapter_luid"),
+                "d3d_adapter_index": None,
             }
         )
     if not devices:
         raise RuntimeError("No NVIDIA GPU was detected.")
+    # Rank devices by the DXGI adapter order the native worker binds from.
+    luid_order = _dxgi_adapter_luids()
+    for device in devices:
+        luid = device.get("adapter_luid")
+        if luid and luid in luid_order:
+            device["d3d_adapter_index"] = luid_order.index(luid)
     return tuple(devices)
 
 
