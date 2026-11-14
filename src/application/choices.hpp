@@ -66,7 +66,7 @@ inline std::optional<QVariant> staticChoices(Property property) {
         return QJsonDocument::fromJson(R"json(["Auto","Copy","Custom"])json").array().toVariantList();
     case Property::fiFpsChoices: {
         QVariantList choices;
-        for (const auto* fps : {"23.976", "25", "29.97", "30", "50", "59.94", "60", "90",
+        for (const auto* fps : {"23.976", "24", "25", "29.97", "30", "50", "59.94", "60", "90",
                                "119.88", "120", "144", "165", "180", "240", "360", "480"}) {
             const auto value = QString::fromLatin1(fps);
             choices.append(QVariantMap{{"label", QCoreApplication::translate("App", "%1 FPS").arg(value)},

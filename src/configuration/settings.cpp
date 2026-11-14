@@ -553,11 +553,11 @@ std::expected<void, QString> Settings::validate() const {
         return std::unexpected("Image bit depth must be 8 or 16.");
     if (image_bit_depth == 16 && image_format != "PNG" && image_format != "TIFF")
         return std::unexpected("16-bit image output is available for PNG and TIFF only.");
-    if (!QStringList{"23.976", "25", "29.97", "30", "50", "59.94", "60", "90", "119.88", "120", "144", "165",
-                     "180", "240", "360", "480"}
+    if (!QStringList{"23.976", "24", "25", "29.97", "30", "50", "59.94", "60", "90", "119.88", "120", "144",
+                     "165", "180", "240", "360", "480"}
              .contains(frame_interpolation_target_fps))
         return std::unexpected("Unsupported output FPS.");
-    if(!QStringList{"23.976","25","29.97","30","50","59.94","60","90","119.88","120","144","165","180","240","360","480"}.contains(fsr_frame_generation_target_fps))
+    if(!QStringList{"23.976","24","25","29.97","30","50","59.94","60","90","119.88","120","144","165","180","240","360","480"}.contains(fsr_frame_generation_target_fps))
         return std::unexpected("Unsupported FSR output FPS.");
     if (ffmpeg_device != "auto" && ffmpeg_device != "cpu" &&
         (!ffmpeg_device.startsWith("vulkan:") || QUuid(ffmpeg_device.mid(7)).isNull()))
